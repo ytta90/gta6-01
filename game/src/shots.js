@@ -1,79 +1,177 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=start|chase|mission|heist. Each one plays
+// the real rules forward from a fresh world, steered by a scripted input (the
+// same keys a player would press), so the frame is what real play looks like
+// and the same seed always gives the same frame.
+import { STEP } from './world.js';
+import { SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { angleDiff, angleTo, dist } from './rng.js';
 
 const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const CHASE_SECONDS = 4;
+const MISSION_SECONDS = 2.5;
+const HEIST_SECONDS = 0.6;
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
+// An input object that presses scripted keys: down() reads the held set,
+// wasPressed() fires once per frame for a key the script tapped.
+class ScriptInput {
+  constructor() {
+    this.held = new Set();
+    this.tapped = new Set();
+    this.mouseX = 0;
+    this.mouseY = 0;
+    this.mouseDown = false;
+    this.mouseClicked = false;
+    this.canvas = null;
   }
-  return Infinity;
+  down(key) { return this.held.has(key); }
+  wasPressed(key) {
+    if (this.tapped.has(key)) { this.tapped.delete(key); return true; }
+    return false;
+  }
+  axis(neg, pos) {
+    return (this.held.has(pos) ? 1 : 0) - (this.held.has(neg) ? 1 : 0);
+  }
+  hold(key) { this.held.add(key); }
+  release(key) { this.held.delete(key); }
+  tap(key) { this.tapped.add(key); }
+  clear() { this.held.clear(); this.tapped.clear(); }
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+// Drive the player's car toward the next intersection straight ahead,
+// turning at the grid's edges: the same steering a player uses.
+function driveScript(world, input) {
+  const s = world.state;
+  const car = s.player.car;
+  if (!car) return;
+  const city = world.city;
+  const node = city.nearestNode(car.x, car.y);
+  const d = dist(car.x, car.y, node.x, node.y);
+  if (d < 50) {
+    // Pick the next node: keep going straight when the road continues.
+    const dx = Math.round(Math.cos(car.angle));
+    const dy = Math.round(Math.sin(car.angle));
+    let nx = node.x + dx * 400;
+    let ny = node.y + dy * 400;
+    if (nx < 160 || nx > 2960 || ny < 160 || ny > 2960) {
+      // Turn: head for the neighbour most aligned with our heading.
+      const options = city.nodes.filter((n) => Math.abs(n.x - node.x) + Math.abs(n.y - node.y) === 400);
+      let next = options[0];
+      let bestDot = -2;
+      for (const o of options) {
+        const dot = Math.cos(car.angle) * (o.x - node.x) / 400 + Math.sin(car.angle) * (o.y - node.y) / 400;
+        if (dot > bestDot) { bestDot = dot; next = o; }
+      }
+      nx = next.x;
+      ny = next.y;
     }
+    driveScript.target = { x: nx, y: ny };
   }
-  return best;
+  const target = driveScript.target || node;
+  const want = angleTo(car.x, car.y, target.x, target.y);
+  const diff = angleDiff(car.angle, want);
+  // Brake for a sharp turn: a 400 px grid corner needs a slow car.
+  input.release('w');
+  input.release('s');
+  input.release('a');
+  input.release('d');
+  if (Math.abs(diff) > 0.45 && Math.abs(car.speed) > 170) {
+    input.hold('s');
+  } else {
+    input.hold('w');
+  }
+  if (diff > 0.12) input.hold('d');
+  else if (diff < -0.12) input.hold('a');
+}
+
+// Walk toward a point, punching when close to an enemy.
+function walkScript(world, input, tx, ty, punchNear) {
+  const s = world.state;
+  const p = s.player;
+  const d = dist(p.x, p.y, tx, ty);
+  const want = angleTo(p.x, p.y, tx, ty);
+  const dx = Math.cos(want);
+  const dy = Math.sin(want);
+  input.release('w');
+  input.release('a');
+  input.release('s');
+  input.release('d');
+  if (d > 26) {
+    if (dx > 0.3) input.hold('d');
+    if (dx < -0.3) input.hold('a');
+    if (dy > 0.3) input.hold('s');
+    if (dy < -0.3) input.hold('w');
+  }
+  if (punchNear && d < 60) input.tap('f');
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it and
+ * the best-run summary to show on the title.
  */
 export function stageShot(name, world) {
+  const input = new ScriptInput();
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  const s = world.state;
+  const city = world.city;
+
+  if (name === 'chase') {
+    // Dana in the coral Comet GT, three stars, VBPD interceptors closing in.
+    // A straight eastbound run down the 960 avenue: no corners to cut, the
+    // chase stays on the road and the cops stay in the mirror.
+    const car = s.cars.find((c) => c.model.sport && c.color === '#ff6b5e');
+    car.x = 560;
+    car.y = 960;
+    s.player.x = car.x + 40;
+    s.player.y = car.y;
+    world.enterCar(car);
+    car.angle = 0;
+    car.speed = 400;
+    s.wanted = 70;
+    driveScript.target = { x: 960, y: 960 };
+    for (let i = 0; i < CHASE_SECONDS / STEP; i += 1) {
+      driveScript(world, input);
+      world.step(STEP, input);
+      if (s.gameOver) break;
+    }
+    return { screen: SCREEN_PLAY, best: { missionsDone: 1, cash: 400 } };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'mission') {
+    // Mission 4, on foot at Burger Barn, Harbor Boys closing in.
+    world.startMission(3);
+    const diner = city.landmarks.diner;
+    const street = city.roadNear(diner.x, diner.y);
+    s.player.x = street.x;
+    s.player.y = street.y;
+    s.player.onFoot = true;
+    for (let i = 0; i < MISSION_SECONDS / STEP; i += 1) {
+      const foe = s.enemies.find((e) => !e.dead);
+      if (foe) walkScript(world, input, foe.x, foe.y, true);
+      world.step(STEP, input);
+      if (s.gameOver) break;
+    }
+    return { screen: SCREEN_PLAY, best: { missionsDone: 3, cash: 1250 } };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'heist') {
+    // Mission 6: holding the bank floor at five stars.
+    world.startMission(5);
+    s.mission.stage = 1;
+    s.mission.holdTimer = 12;
+    const bank = city.landmarks.bank;
+    const street = city.roadNear(bank.x, bank.y);
+    s.player.x = street.x;
+    s.player.y = street.y;
+    s.player.onFoot = true;
+    s.wanted = 100;
+    for (let i = 0; i < HEIST_SECONDS / STEP; i += 1) {
+      world.step(STEP, input);
+      if (s.gameOver) break;
+    }
+    return { screen: SCREEN_PLAY, best: { missionsDone: 5, cash: 2350 } };
+  }
+
+  // Default: the title over a living city.
+  for (let i = 0; i < START_SECONDS / STEP; i += 1) world.step(STEP, input);
+  return { screen: SCREEN_TITLE, best: { missionsDone: 0, cash: 0 } };
 }
